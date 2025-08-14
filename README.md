@@ -40,6 +40,9 @@ Follow these steps to get the application running locally for development and te
 
 ```bash
 cd backend
+#macbook
+/usr/local/bin/python3.12 -m pip install . --break-system-packages --index-url https://pypi.org/simple/
+#other
 pip install .
 ```
 

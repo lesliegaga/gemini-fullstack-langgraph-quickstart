@@ -7,6 +7,7 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
+from langgraph.prebuilt import create_react_agent
 from google.genai import Client
 
 from agent.state import (
@@ -23,6 +24,7 @@ from agent.prompts import (
     web_searcher_instructions,
     reflection_instructions,
     answer_instructions,
+    amap_searcher_instructions,
 )
 from langchain_google_genai import ChatGoogleGenerativeAI
 from agent.utils import (
@@ -32,10 +34,9 @@ from agent.utils import (
     resolve_urls,
 )
 import asyncio
+import concurrent.futures
 import os
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from langchain_mcp_adapters.tools import load_mcp_tools
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 load_dotenv()
 
@@ -45,56 +46,9 @@ if os.getenv("GEMINI_API_KEY") is None:
 # Used for Google Search API
 genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Global variable to store MCP tools
+# MCP客户端和工具存储
+mcp_client = None
 amap_tools = None
-
-async def load_amap_mcp_tools():
-    """加载高德MCP工具。"""
-    global amap_tools
-    
-    if amap_tools is not None:
-        return amap_tools
-    
-    try:
-        # 配置高德MCP服务器参数
-        server_params = StdioServerParameters(
-            command="npx",
-            args=["-y", "@amap/amap-maps-mcp-server"],
-            env={
-                "AMAP_MAPS_API_KEY": os.getenv("AMAP_MAPS_API_KEY", "")
-            }
-        )
-        
-        # 建立与MCP服务器的会话并加载工具
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                amap_tools = await load_mcp_tools(session)
-                
-        return amap_tools
-        
-    except Exception as e:
-        print(f"Failed to load Amap MCP tools: {e}")
-        return []
-
-
-def has_location_intent(query: str) -> bool:
-    """检测查询是否包含地理位置意图。
-    
-    Args:
-        query: 搜索查询字符串
-        
-    Returns:
-        如果查询包含地理位置意图，返回True
-    """
-    location_indicators = [
-        "附近", "周边", "周围", "旁边", "地址", "位置", "在哪",
-        "怎么走", "路线", "导航", "距离", "坐标",
-        "市", "区", "县", "街", "路", "广场", "商场", "中心"
-    ]
-    
-    return any(indicator in query for indicator in location_indicators)
-
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
@@ -148,9 +102,7 @@ def continue_to_research(state: QueryGenerationState):
         # 总是进行网络搜索
         tasks.append(Send("web_research", {"search_query": search_query, "id": int(idx)}))
         
-        # 检测是否需要地理位置搜索
-        if has_location_intent(search_query):
-            tasks.append(Send("amap_research", {"search_query": search_query, "id": int(idx)}))
+        tasks.append(Send("amap_research", {"search_query": search_query, "id": int(idx)}))
     
     return tasks
 
@@ -199,10 +151,10 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     }
 
 
-async def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallState:
+def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallState:
     """LangGraph node that performs location-based research using Amap MCP service.
 
-    Executes location-based search using Amap (高德地图) MCP service.
+    Executes location-based search using Amap (高德地图) MCP service with React agent.
 
     Args:
         state: Current graph state containing the search query and research loop count
@@ -211,20 +163,20 @@ async def amap_research(state: AmapSearchState, config: RunnableConfig) -> Overa
     Returns:
         Dictionary with state update, including amap_research_result
     """
+    global amap_tools
+    
     try:
         search_query = state["search_query"]
         
-        # 加载高德MCP工具
-        tools = await load_amap_mcp_tools()
-        
-        if not tools:
-            error_result = f"高德MCP工具加载失败\n查询：{search_query}"
+        # 检查预加载的工具
+        if not amap_tools:
+            error_result = f"高德MCP工具未初始化\n查询：{search_query}"
             return {
                 "search_query": [state["search_query"]],
                 "amap_research_result": [error_result],
             }
         
-        # 创建一个简单的LLM来使用MCP工具
+        # 创建LLM来使用MCP工具
         configurable = Configuration.from_runnable_config(config)
         llm = ChatGoogleGenerativeAI(
             model=configurable.query_generator_model,
@@ -233,26 +185,25 @@ async def amap_research(state: AmapSearchState, config: RunnableConfig) -> Overa
             api_key=os.getenv("GEMINI_API_KEY"),
         )
         
-        # 将LLM与MCP工具绑定
-        llm_with_tools = llm.bind_tools(tools)
+        # 创建React Agent来执行工具调用
+        agent = create_react_agent(llm, amap_tools)
         
-        # 创建专门的高德搜索提示
-        amap_prompt = f"""请使用高德地图工具来搜索以下查询的相关信息：
+        # 使用优化的高德搜索提示
+        current_date = get_current_date()
+        formatted_prompt = amap_searcher_instructions.format(
+            search_query=search_query,
+            current_date=current_date
+        )
         
-查询：{search_query}
-
-请按照以下步骤：
-1. 如果查询包含地点名称，先使用地理编码工具获取该地点的坐标
-2. 然后使用周边搜索工具查找相关的POI信息
-3. 提供详细的搜索结果，包括地点名称、地址、距离等信息
-
-请用中文回答，并提供结构化的结果。"""
+        # 调用React Agent处理查询并实际执行工具
+        response = agent.invoke({"messages": [{"role": "user", "content": formatted_prompt}]})
         
-        # 调用LLM处理查询
-        response = await llm_with_tools.ainvoke(amap_prompt)
+        # 获取最后一条消息的内容
+        last_message = response["messages"][-1]
+        result_content = last_message.content if hasattr(last_message, 'content') else str(last_message)
         
         # 格式化结果
-        formatted_result = f"**高德地图搜索结果**\n查询：{search_query}\n\n{response.content}"
+        formatted_result = f"**高德地图搜索结果**\n查询：{search_query}\n\n{result_content}"
         
         return {
             "search_query": [state["search_query"]],
@@ -353,15 +304,13 @@ def evaluate_research(
                 }
             ))
             
-            # 检测是否需要地理位置搜索
-            if has_location_intent(follow_up_query):
-                tasks.append(Send(
-                    "amap_research",
-                    {
-                        "search_query": follow_up_query,
-                        "id": task_id,
-                    }
-                ))
+            tasks.append(Send(
+                "amap_research",
+                {
+                    "search_query": follow_up_query,
+                    "id": task_id,
+                }
+            ))
         
         return tasks
 
@@ -417,31 +366,73 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     }
 
 
-# Create our Agent Graph
-builder = StateGraph(OverallState, config_schema=Configuration)
+async def make_graph():
+    """创建并初始化LangGraph图，包括MCP工具的异步加载。
+    
+    参考langchain-mcp-adapters的"Using with LangGraph StateGraph"示例。
+    
+    Returns:
+        编译好的LangGraph图实例
+    """
+    global mcp_client, amap_tools
+    
+    # 初始化MCP客户端
+    try:
+        mcp_client = MultiServerMCPClient(
+            {
+                "amap": {
+                    "command": "npx",
+                    "args": ["-y", "@amap/amap-maps-mcp-server"],
+                    "transport": "stdio",
+                    "env": {
+                        "AMAP_MAPS_API_KEY": os.getenv("AMAP_MAPS_API_KEY", "")
+                    }
+                }
+            }
+        )
+        
+        # 加载高德MCP工具
+        amap_tools = await mcp_client.get_tools()
+        print(f"✅ 成功加载 {len(amap_tools)} 个高德MCP工具")
+        
+    except Exception as e:
+        print(f"⚠️ 高德MCP工具加载失败: {e}")
+        print("系统将在没有高德地图支持的情况下运行")
+        amap_tools = []
+    
+    # 创建Agent图
+    builder = StateGraph(OverallState, config_schema=Configuration)
 
-# Define the nodes we will cycle between
-builder.add_node("generate_query", generate_query)
-builder.add_node("web_research", web_research)
-builder.add_node("amap_research", amap_research)
-builder.add_node("reflection", reflection)
-builder.add_node("finalize_answer", finalize_answer)
+    # 定义节点
+    builder.add_node("generate_query", generate_query)
+    builder.add_node("web_research", web_research)
+    builder.add_node("amap_research", amap_research)
+    builder.add_node("reflection", reflection)
+    builder.add_node("finalize_answer", finalize_answer)
 
-# Set the entrypoint as `generate_query`
-# This means that this node is the first one called
-builder.add_edge(START, "generate_query")
-# Add conditional edge to continue with search queries in parallel branches
-builder.add_conditional_edges(
-    "generate_query", continue_to_research, ["web_research", "amap_research"]
-)
-# Reflect on both web research and amap research
-builder.add_edge("web_research", "reflection")
-builder.add_edge("amap_research", "reflection")
-# Evaluate the research
-builder.add_conditional_edges(
-    "reflection", evaluate_research, ["web_research", "amap_research", "finalize_answer"]
-)
-# Finalize the answer
-builder.add_edge("finalize_answer", END)
+    # 设置入口点
+    builder.add_edge(START, "generate_query")
+    
+    # 添加条件边以继续并行分支的搜索查询
+    builder.add_conditional_edges(
+        "generate_query", continue_to_research, ["web_research", "amap_research"]
+    )
+    
+    # 反思网络搜索和高德搜索
+    builder.add_edge("web_research", "reflection")
+    builder.add_edge("amap_research", "reflection")
+    
+    # 评估研究
+    builder.add_conditional_edges(
+        "reflection", evaluate_research, ["web_research", "amap_research", "finalize_answer"]
+    )
+    
+    # 完成答案
+    builder.add_edge("finalize_answer", END)
 
-graph = builder.compile(name="pro-search-agent")
+    return builder.compile(name="pro-search-agent")
+
+
+# 为了向后兼容，保留同步图变量
+# 但推荐使用make_graph()函数来获取图实例
+graph = None
