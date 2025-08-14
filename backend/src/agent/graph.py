@@ -1,6 +1,6 @@
 import os
 
-from agent.tools_and_schemas import SearchQueryList, Reflection
+from agent.tools_and_schemas import SearchQueryList, Reflection, DualSearchQueryList, DualReflection
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage
 from langgraph.types import Send
@@ -21,12 +21,15 @@ from agent.configuration import Configuration
 from agent.prompts import (
     get_current_date,
     query_writer_instructions,
+    dual_query_writer_instructions,
     web_searcher_instructions,
     reflection_instructions,
+    dual_reflection_instructions,
     answer_instructions,
     amap_searcher_instructions,
 )
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from agent.utils import (
     get_citations,
     get_research_topic,
@@ -34,10 +37,8 @@ from agent.utils import (
     resolve_urls,
 )
 import asyncio
-import concurrent.futures
 import os
 from langchain_mcp_adapters.client import MultiServerMCPClient
-
 load_dotenv()
 
 if os.getenv("GEMINI_API_KEY") is None:
@@ -52,17 +53,17 @@ amap_tools = None
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
-    """LangGraph node that generates a search queries based on the User's question.
+    """LangGraph node that generates dual search queries based on the User's question.
 
-    Uses Gemini 2.0 Flash to create an optimized search query for web research based on
-    the User's question.
+    Uses Qwen3 32B to create optimized search queries for both web research and map search
+    based on the User's question.
 
     Args:
         state: Current graph state containing the User's question
         config: Configuration for the runnable, including LLM provider settings
 
     Returns:
-        Dictionary with state update, including search_query key containing the generated query
+        Dictionary with state update, including web_query_list and map_query_list
     """
     configurable = Configuration.from_runnable_config(config)
 
@@ -70,25 +71,35 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
+    # init Qwen3 32B
+    llm = ChatOpenAI(
+        base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
+        max_tokens=10000,
+        model="qwen3_32b",
+        timeout=120,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    structured_llm = llm.with_structured_output(DualSearchQueryList)
 
     # Format the prompt
     current_date = get_current_date()
-    formatted_prompt = query_writer_instructions.format(
+    formatted_prompt = dual_query_writer_instructions.format(
         current_date=current_date,
         research_topic=get_research_topic(state["messages"]),
         number_queries=state["initial_search_query_count"],
     )
-    # Generate the search queries
+    # Generate the dual search queries
     result = structured_llm.invoke(formatted_prompt)
-    return {"query_list": result.query}
+    
+    # Convert to Query format for consistency
+    web_queries = [{"query": q, "rationale": result.web_rationale} for q in result.web_queries]
+    map_queries = [{"query": q, "rationale": result.map_rationale} for q in result.map_queries]
+    
+    return {
+        "web_query_list": web_queries,
+        "map_query_list": map_queries
+    }
 
 
 def continue_to_research(state: QueryGenerationState):
@@ -97,12 +108,17 @@ def continue_to_research(state: QueryGenerationState):
     This is used to spawn parallel research tasks for each query.
     """
     tasks = []
+    task_id = 0
     
-    for idx, search_query in enumerate(state["query_list"]):
-        # 总是进行网络搜索
-        tasks.append(Send("web_research", {"search_query": search_query, "id": int(idx)}))
-        
-        tasks.append(Send("amap_research", {"search_query": search_query, "id": int(idx)}))
+    # 处理网络搜索查询
+    for web_query in state["web_query_list"]:
+        tasks.append(Send("web_research", {"search_query": web_query["query"], "id": int(task_id)}))
+        task_id += 1
+    
+    # 处理地图搜索查询
+    for map_query in state["map_query_list"]:
+        tasks.append(Send("amap_research", {"search_query": map_query["query"], "id": int(task_id)}))
+        task_id += 1
     
     return tasks
 
@@ -178,15 +194,14 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
         
         # 创建LLM来使用MCP工具
         configurable = Configuration.from_runnable_config(config)
-        llm = ChatGoogleGenerativeAI(
-            model=configurable.query_generator_model,
+        llm = ChatOpenAI(
+            base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
+            max_tokens=10000,
+            model="qwen3_32b",
+            timeout=120,
             temperature=0.1,
             max_retries=2,
-            api_key=os.getenv("GEMINI_API_KEY"),
         )
-        
-        # 创建React Agent来执行工具调用
-        agent = create_react_agent(llm, amap_tools)
         
         # 使用优化的高德搜索提示
         current_date = get_current_date()
@@ -195,12 +210,20 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
             current_date=current_date
         )
         
-        # 调用React Agent处理查询并实际执行工具
-        response = agent.invoke({"messages": [{"role": "user", "content": formatted_prompt}]})
+        # 定义异步执行函数
+        async def execute_amap_research():
+            # 创建React Agent来执行工具调用
+            agent = create_react_agent(llm, amap_tools)
+            
+            # 调用React Agent处理查询并实际执行工具
+            response = await agent.ainvoke({"messages": [{"role": "user", "content": formatted_prompt}]})
+            
+            # 获取最后一条消息的内容
+            last_message = response["messages"][-1]
+            return last_message.content if hasattr(last_message, 'content') else str(last_message)
         
-        # 获取最后一条消息的内容
-        last_message = response["messages"][-1]
-        result_content = last_message.content if hasattr(last_message, 'content') else str(last_message)
+        # 在同步函数中运行异步代码
+        result_content = asyncio.run(execute_amap_research())
         
         # 格式化结果
         formatted_result = f"**高德地图搜索结果**\n查询：{search_query}\n\n{result_content}"
@@ -223,15 +246,15 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     """LangGraph node that identifies knowledge gaps and generates potential follow-up queries.
 
     Analyzes the current summary to identify areas for further research and generates
-    potential follow-up queries. Uses structured output to extract
-    the follow-up query in JSON format.
+    potential follow-up queries for both web and map search. Uses structured output to extract
+    the follow-up queries in JSON format.
 
     Args:
         state: Current graph state containing the running summary and research topic
         config: Configuration for the runnable, including LLM provider settings
 
     Returns:
-        Dictionary with state update, including search_query key containing the generated follow-up query
+        Dictionary with state update, including dual follow-up queries
     """
     configurable = Configuration.from_runnable_config(config)
     # Increment the research loop count and get the reasoning model
@@ -243,24 +266,31 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     # 合并网络搜索和高德搜索结果
     all_research_results = state.get("web_research_result", []) + state.get("amap_research_result", [])
     
-    formatted_prompt = reflection_instructions.format(
+    formatted_prompt = dual_reflection_instructions.format(
         current_date=current_date,
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(all_research_results),
     )
     # init Reflection Model
-    llm = ChatGoogleGenerativeAI(
-        model=reflection_model,
+    llm = ChatOpenAI(
+        base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
+        max_tokens=10000,
+        model="qwen3_32b",
+        timeout=120,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    result = llm.with_structured_output(DualReflection).invoke(formatted_prompt)
+
+    # Combine web and map follow-up queries for backward compatibility
+    combined_follow_up_queries = result.web_follow_up_queries + result.map_follow_up_queries
 
     return {
         "is_sufficient": result.is_sufficient,
         "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
+        "follow_up_queries": combined_follow_up_queries,
+        "web_follow_up_queries": result.web_follow_up_queries,
+        "map_follow_up_queries": result.map_follow_up_queries,
         "research_loop_count": state["research_loop_count"],
         "number_of_ran_queries": len(state["search_query"]),
     }
@@ -280,7 +310,7 @@ def evaluate_research(
         config: Configuration for the runnable, including max_research_loops setting
 
     Returns:
-        String literal indicating the next node to visit ("web_research" or "finalize_summary")
+        String literal indicating the next node to visit or task list for follow-up research
     """
     configurable = Configuration.from_runnable_config(config)
     max_research_loops = (
@@ -292,25 +322,29 @@ def evaluate_research(
         return "finalize_answer"
     else:
         tasks = []
-        for idx, follow_up_query in enumerate(state["follow_up_queries"]):
-            task_id = state["number_of_ran_queries"] + int(idx)
-            
-            # 总是进行网络搜索
+        task_id = state["number_of_ran_queries"]
+        
+        # 处理网络搜索后续查询
+        for web_follow_up_query in state.get("web_follow_up_queries", []):
             tasks.append(Send(
                 "web_research",
                 {
-                    "search_query": follow_up_query,
+                    "search_query": web_follow_up_query,
                     "id": task_id,
                 }
             ))
+            task_id += 1
             
+        # 处理地图搜索后续查询
+        for map_follow_up_query in state.get("map_follow_up_queries", []):
             tasks.append(Send(
                 "amap_research",
                 {
-                    "search_query": follow_up_query,
+                    "search_query": map_follow_up_query,
                     "id": task_id,
                 }
             ))
+            task_id += 1
         
         return tasks
 
@@ -342,12 +376,14 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(all_research_results),
     )
 
-    # init Answer Model, default to Gemini 2.5 Pro
-    llm = ChatGoogleGenerativeAI(
-        model=answer_model,
+    # init Answer Model, default to Qwen3 32B
+    llm = ChatOpenAI(
+        base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
+        max_tokens=10000,
+        model="qwen3_32b",
+        timeout=120,
         temperature=0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
     result = llm.invoke(formatted_prompt)
 

@@ -28,6 +28,8 @@ class ReflectionState(TypedDict):
     is_sufficient: bool
     knowledge_gap: str
     follow_up_queries: Annotated[list, operator.add]
+    web_follow_up_queries: Annotated[list, operator.add]
+    map_follow_up_queries: Annotated[list, operator.add]
     research_loop_count: int
     number_of_ran_queries: int
 
@@ -38,7 +40,8 @@ class Query(TypedDict):
 
 
 class QueryGenerationState(TypedDict):
-    query_list: list[Query]
+    web_query_list: list[Query]
+    map_query_list: list[Query]
 
 
 class WebSearchState(TypedDict):
