@@ -215,8 +215,11 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
             # 创建React Agent来执行工具调用
             agent = create_react_agent(llm, amap_tools)
             
-            # 调用React Agent处理查询并实际执行工具
-            response = await agent.ainvoke({"messages": [{"role": "user", "content": formatted_prompt}]})
+            # 调用React Agent处理查询并实际执行工具，设置递归限制为100
+            response = await agent.ainvoke(
+                {"messages": [{"role": "user", "content": formatted_prompt}]},
+                config={"recursion_limit": 100}
+            )
             
             # 获取最后一条消息的内容
             last_message = response["messages"][-1]
@@ -466,7 +469,11 @@ async def make_graph():
     # 完成答案
     builder.add_edge("finalize_answer", END)
 
-    return builder.compile(name="pro-search-agent")
+    return builder.compile(
+        name="pro-search-agent"
+        # 注意：递归限制在新版本LangGraph中通过其他方式设置
+        # 当前版本通过RunnableConfig在运行时传递recursion_limit
+    )
 
 
 # 为了向后兼容，保留同步图变量

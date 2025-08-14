@@ -39,6 +39,11 @@ class Configuration(BaseModel):
         metadata={"description": "The maximum number of research loops to perform."},
     )
 
+    recursion_limit: int = Field(
+        default=100,
+        metadata={"description": "The maximum recursion limit for the graph execution."},
+    )
+
     @classmethod
     def from_runnable_config(
         cls, config: Optional[RunnableConfig] = None
