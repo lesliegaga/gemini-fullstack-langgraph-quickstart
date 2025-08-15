@@ -24,8 +24,20 @@ def resolve_urls(urls_to_resolve: List[Any], id: int) -> Dict[str, str]:
     Create a map of the vertex ai search urls (very long) to a short url with a unique id for each url.
     Ensures each original URL gets a consistent shortened form while maintaining uniqueness.
     """
+    # 添加防御性检查
+    if not urls_to_resolve:
+        return {}
+    
+    try:
+        urls = [site.web.uri for site in urls_to_resolve if hasattr(site, 'web') and hasattr(site.web, 'uri')]
+    except (TypeError, AttributeError):
+        # 如果无法迭代或结构不正确，返回空字典
+        return {}
+    
+    if not urls:
+        return {}
+
     prefix = f"https://vertexaisearch.cloud.google.com/id/"
-    urls = [site.web.uri for site in urls_to_resolve]
 
     # Create a dictionary that maps each unique URL to its first occurrence index
     resolved_map = {}
@@ -50,6 +62,10 @@ def insert_citation_markers(text, citations_list):
     Returns:
         str: The text with citation markers inserted.
     """
+    # 检查 citations_list 是否有效
+    if not citations_list or not text:
+        return text
+    
     # Sort citations by end_index in descending order.
     # If end_index is the same, secondary sort by start_index descending.
     # This ensures that insertions at the end of the string don't affect
@@ -107,6 +123,10 @@ def get_citations(response, resolved_urls_map):
     """
     citations = []
 
+    # 检查 resolved_urls_map 是否有效
+    if not resolved_urls_map:
+        return citations
+
     # Ensure response and necessary nested structures are present
     if not response or not response.candidates:
         return citations
@@ -150,17 +170,22 @@ def get_citations(response, resolved_urls_map):
                 try:
                     chunk = candidate.grounding_metadata.grounding_chunks[ind]
                     resolved_url = resolved_urls_map.get(chunk.web.uri, None)
-                    citation["segments"].append(
-                        {
-                            "label": chunk.web.title.split(".")[:-1][0],
-                            "short_url": resolved_url,
-                            "value": chunk.web.uri,
-                        }
-                    )
+                    if resolved_url:  # 只有当 resolved_url 存在时才添加
+                        citation["segments"].append(
+                            {
+                                "label": chunk.web.title.split(".")[:-1][0],
+                                "short_url": resolved_url,
+                                "value": chunk.web.uri,
+                            }
+                        )
                 except (IndexError, AttributeError, NameError):
                     # Handle cases where chunk, web, uri, or resolved_map might be problematic
                     # For simplicity, we'll just skip adding this particular segment link
                     # In a production system, you might want to log this.
                     pass
-        citations.append(citation)
+        
+        # 只有当 segments 不为空时才添加 citation
+        if citation["segments"]:
+            citations.append(citation)
+    
     return citations

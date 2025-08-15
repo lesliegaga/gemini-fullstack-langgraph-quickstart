@@ -48,9 +48,122 @@ if os.getenv("GEMINI_API_KEY") is None:
 # Used for Google Search API
 genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+# MCP配置常量
+MCP_HEALTH_CHECK_INTERVAL = 300  # 健康检查间隔（秒）
+MCP_MAX_RETRIES = 3  # 最大重试次数
+MCP_SERVER_CONFIG = {
+    "amap": {
+        "command": "npx",
+        "args": ["-y", "@amap/amap-maps-mcp-server"],
+        "transport": "stdio",
+        "env": {
+            "AMAP_MAPS_API_KEY": os.getenv("AMAP_MAPS_API_KEY", "")
+        }
+    }
+}
+
 # MCP客户端和工具存储
 mcp_client = None
 amap_tools = None
+_mcp_initialized = False  # 标记是否已初始化
+_mcp_last_health_check = 0  # 最后健康检查时间
+_mcp_health_check_interval = MCP_HEALTH_CHECK_INTERVAL  # 健康检查间隔（秒）
+_mcp_retry_count = 0  # 重试次数
+_max_mcp_retries = MCP_MAX_RETRIES  # 最大重试次数
+
+
+async def check_mcp_health():
+    """检查MCP连接的健康状态"""
+    global mcp_client, amap_tools, _mcp_last_health_check
+    
+    import time
+    current_time = time.time()
+    
+    # 如果距离上次检查时间太短，跳过检查
+    if current_time - _mcp_last_health_check < _mcp_health_check_interval:
+        return amap_tools is not None and len(amap_tools) > 0
+    
+    _mcp_last_health_check = current_time
+    
+    try:
+        if mcp_client and amap_tools:
+            # 尝试获取工具列表来验证连接是否正常
+            tools = await mcp_client.get_tools()
+            if tools and len(tools) > 0:
+                print(f"✅ MCP连接健康检查通过，当前有 {len(tools)} 个工具")
+                return True
+            else:
+                print("⚠️ MCP连接健康检查失败：工具列表为空")
+                return False
+        else:
+            print("⚠️ MCP连接健康检查失败：客户端或工具未初始化")
+            return False
+    except Exception as e:
+        print(f"⚠️ MCP连接健康检查异常：{e}")
+        return False
+
+
+async def initialize_mcp_tools():
+    """初始化MCP工具（单例模式，只初始化一次）"""
+    global mcp_client, amap_tools, _mcp_initialized, _mcp_retry_count
+    
+    if _mcp_initialized:
+        # 检查连接健康状态
+        if await check_mcp_health():
+            print(f"🔄 MCP工具已初始化且健康，返回缓存的 {len(amap_tools)} 个工具")
+            return amap_tools
+        else:
+            print("⚠️ MCP连接不健康，尝试重新初始化...")
+            _mcp_initialized = False
+            _mcp_retry_count += 1
+    
+    # 检查重试次数
+    if _mcp_retry_count >= _max_mcp_retries:
+        print(f"❌ MCP工具初始化失败次数过多（{_mcp_retry_count}次），停止重试")
+        amap_tools = []
+        _mcp_initialized = True
+        return amap_tools
+    
+    try:
+        print(f"🚀 {'重新' if _mcp_initialized else '首次'}初始化MCP客户端... (尝试 {_mcp_retry_count + 1}/{_max_mcp_retries})")
+        
+        # 如果已有客户端，先关闭
+        if mcp_client:
+            try:
+                await mcp_client.aclose()
+            except:
+                pass
+        
+        mcp_client = MultiServerMCPClient(
+            MCP_SERVER_CONFIG
+        )
+        
+        # 加载高德MCP工具
+        amap_tools = await mcp_client.get_tools()
+        _mcp_initialized = True
+        _mcp_retry_count = 0  # 重置重试计数
+        print(f"✅ 成功加载 {len(amap_tools)} 个高德MCP工具")
+        
+    except Exception as e:
+        print(f"⚠️ 高德MCP工具加载失败: {e}")
+        print("系统将在没有高德地图支持的情况下运行")
+        amap_tools = []
+        _mcp_initialized = True  # 即使失败也标记为已初始化，避免重复尝试
+    
+    return amap_tools
+
+
+async def get_amap_tools():
+    """获取高德MCP工具（延迟加载 + 健康检查）"""
+    if not _mcp_initialized:
+        return await initialize_mcp_tools()
+    
+    # 检查连接健康状态
+    if await check_mcp_health():
+        return amap_tools
+    else:
+        print("🔄 MCP连接不健康，重新初始化...")
+        return await initialize_mcp_tools()
 
 
 class CustomReactAgent:
@@ -95,6 +208,7 @@ class CustomReactAgent:
                 token_usage = metadata['token_usage']
                 if 'total_tokens' in token_usage:
                     self.total_prompt_tokens = token_usage['total_tokens']
+        print(f"更新token使用情况: {self.total_prompt_tokens} usage: {response.usage if hasattr(response, 'usage') else 'None'}")
     
     def add_tool_message_tokens(self, tool_message):
         """计算并添加ToolMessage内容的token数量到总计数中"""
@@ -152,6 +266,10 @@ class CustomReactAgent:
             # 更新token使用情况
             self.update_token_usage(response)
             messages.append(response)
+
+            if self.get_total_prompt_tokens() > self.max_context_length:
+                print(f"当前token数量: {self.get_total_prompt_tokens()} 超过最大上下文长度: {self.max_context_length}")
+                continue
             
             # 检查是否需要调用工具
             if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -186,6 +304,9 @@ class CustomReactAgent:
                             messages.append(tool_message)
                             # 计算并添加错误消息的token数量
                             self.add_tool_message_tokens(tool_message)
+                            if self.get_total_prompt_tokens() > self.max_context_length:
+                                print(f"当前token数量: {self.get_total_prompt_tokens()} 超过最大上下文长度: {self.max_context_length}")
+                                break
             else:
                 # 没有工具调用，结束循环
                 break
@@ -292,10 +413,36 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
             "temperature": 0,
         },
     )
+    
+    # 检查响应是否有效
+    if not response or not response.candidates:
+        error_result = f"Google Search API 返回无效响应\n查询：{state['search_query']}"
+        return {
+            "sources_gathered": [],
+            "search_query": [state["search_query"]],
+            "web_research_result": [error_result],
+        }
+    
+    candidate = response.candidates[0]
+    
+    # 检查是否有 grounding_metadata 和 grounding_chunks
+    if (not hasattr(candidate, "grounding_metadata") or 
+        not candidate.grounding_metadata or 
+        not hasattr(candidate.grounding_metadata, "grounding_chunks") or
+        not candidate.grounding_metadata.grounding_chunks):
+        
+        # 如果没有 grounding 信息，返回原始响应文本
+        return {
+            "sources_gathered": [],
+            "search_query": [state["search_query"]],
+            "web_research_result": [f"搜索结果（无引用信息）：\n{response.text}"],
+        }
+    
     # resolve the urls to short urls for saving tokens and time
     resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
+        candidate.grounding_metadata.grounding_chunks, state["id"]
     )
+    
     # Gets the citations and adds them to the generated text
     citations = get_citations(response, resolved_urls)
     modified_text = insert_citation_markers(response.text, citations)
@@ -320,8 +467,6 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
     Returns:
         Dictionary with state update, including amap_research_result
     """
-    global amap_tools
-    
     try:
         search_query = state["search_query"]
         
@@ -337,7 +482,7 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
         configurable = Configuration.from_runnable_config(config)
         llm = ChatOpenAI(
             base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
-            max_tokens=10000,
+            max_tokens=15000,
             model="qwen3_32b",
             timeout=120,
             temperature=0.1,
@@ -418,7 +563,7 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     # init Reflection Model
     llm = ChatOpenAI(
         base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
-        max_tokens=10000,
+        max_tokens=15000,
         model="qwen3_32b",
         timeout=120,
         temperature=1.0,
@@ -523,7 +668,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     # init Answer Model, default to Qwen3 32B
     llm = ChatOpenAI(
         base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
-        max_tokens=10000,
+        max_tokens=15000,
         model="qwen3_32b",
         timeout=120,
         temperature=0,
@@ -554,31 +699,8 @@ async def make_graph():
     Returns:
         编译好的LangGraph图实例
     """
-    global mcp_client, amap_tools
-    
-    # 初始化MCP客户端
-    try:
-        mcp_client = MultiServerMCPClient(
-            {
-                "amap": {
-                    "command": "npx",
-                    "args": ["-y", "@amap/amap-maps-mcp-server"],
-                    "transport": "stdio",
-                    "env": {
-                        "AMAP_MAPS_API_KEY": os.getenv("AMAP_MAPS_API_KEY", "")
-                    }
-                }
-            }
-        )
-        
-        # 加载高德MCP工具
-        amap_tools = await mcp_client.get_tools()
-        print(f"✅ 成功加载 {len(amap_tools)} 个高德MCP工具")
-        
-    except Exception as e:
-        print(f"⚠️ 高德MCP工具加载失败: {e}")
-        print("系统将在没有高德地图支持的情况下运行")
-        amap_tools = []
+    # 确保MCP工具已初始化（只初始化一次）
+    await initialize_mcp_tools()
     
     # 创建Agent图
     builder = StateGraph(OverallState, config_schema=Configuration)
