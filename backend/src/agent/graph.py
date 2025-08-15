@@ -2,7 +2,8 @@ import os
 
 from agent.tools_and_schemas import SearchQueryList, Reflection, DualSearchQueryList, DualReflection
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
@@ -50,6 +51,146 @@ genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
 # MCP客户端和工具存储
 mcp_client = None
 amap_tools = None
+
+
+class CustomReactAgent:
+    """自定义React Agent，支持上下文长度检查和智能停止机制"""
+    
+    def __init__(self, llm, tools, max_context_length=15000):
+        self.llm = llm
+        self.tools = tools
+        self.max_context_length = max_context_length
+        self.tool_map = {tool.name: tool for tool in tools}
+        self.total_prompt_tokens = 0  # 跟踪总的prompt tokens
+    
+    def get_total_prompt_tokens(self):
+        """获取累积的prompt tokens总数"""
+        return self.total_prompt_tokens
+    
+    def calculate_text_tokens(self, text):
+        """计算文本的token数量"""
+        try:
+            # 对于 ChatOpenAI，使用 get_num_tokens 方法
+            if hasattr(self.llm, 'get_num_tokens'):
+                return self.llm.get_num_tokens(text)
+            # 对于其他 LLM，使用简单的字符估算（粗略估算）
+            else:
+                # 粗略估算：英文约4个字符1个token，中文约2个字符1个token
+                english_chars = sum(1 for c in text if ord(c) < 128)
+                chinese_chars = len(text) - english_chars
+                return english_chars // 4 + chinese_chars // 2
+        except Exception:
+            # 如果计算失败，使用字符数作为后备方案
+            return len(text) // 3
+    
+    def update_token_usage(self, response):
+        """从LLM响应中提取并更新token使用情况"""
+        if hasattr(response, 'usage') and response.usage:
+            if hasattr(response.usage, 'total_tokens'):
+                self.total_prompt_tokens = response.usage.total_tokens
+        elif hasattr(response, 'response_metadata') and response.response_metadata:
+            # 尝试从response_metadata中获取token信息
+            metadata = response.response_metadata
+            if 'token_usage' in metadata:
+                token_usage = metadata['token_usage']
+                if 'total_tokens' in token_usage:
+                    self.total_prompt_tokens = token_usage['total_tokens']
+    
+    def add_tool_message_tokens(self, tool_message):
+        """计算并添加ToolMessage内容的token数量到总计数中"""
+        if hasattr(tool_message, 'content') and tool_message.content:
+            content_tokens = self.calculate_text_tokens(str(tool_message.content))
+            self.total_prompt_tokens += content_tokens
+            print(f"ToolMessage 内容添加了 {content_tokens} 个tokens，总计: {self.total_prompt_tokens}")
+    
+    async def ainvoke(self, input_data, config=None):
+        """异步执行React Agent逻辑，支持上下文长度检查"""
+        messages = input_data.get("messages", [])
+        max_iterations = config.get("recursion_limit", 100) if config else 100
+        
+        # 确保消息格式正确
+        formatted_messages = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                if msg.get("role") == "user":
+                    formatted_messages.append(HumanMessage(content=msg["content"]))
+                elif msg.get("role") == "assistant":
+                    formatted_messages.append(AIMessage(content=msg["content"]))
+                else:
+                    formatted_messages.append(HumanMessage(content=str(msg)))
+            else:
+                formatted_messages.append(msg)
+        
+        messages = formatted_messages
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # 检查上下文长度（使用token数）
+            current_tokens = self.get_total_prompt_tokens()
+            
+            if current_tokens > self.max_context_length:
+                # 修改最后一条用户消息，添加停止指令
+                stop_instruction = """您现在已经达到了可以处理的最大上下文长度。您应该停止进行工具调用，并基于以上所有信息重新思考，提供您认为最可能的答案。请基于您迄今为止收集的所有信息提供一份全面的总结报告。"""
+                
+                # 添加停止指令作为新的用户消息
+                messages.append(HumanMessage(content=stop_instruction))
+                
+                # 调用LLM生成最终回答
+                final_response = await self.llm.ainvoke(messages)
+                # 更新token使用情况
+                self.update_token_usage(final_response)
+                messages.append(final_response)
+                break
+            
+            # 创建带工具的LLM链
+            llm_with_tools = self.llm.bind_tools(self.tools)
+            
+            # 调用LLM获取下一步行动
+            response = await llm_with_tools.ainvoke(messages)
+            # 更新token使用情况
+            self.update_token_usage(response)
+            messages.append(response)
+            
+            # 检查是否需要调用工具
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                # 处理工具调用
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["args"]
+                    tool_call_id = tool_call.get("id", "")
+                    
+                    if tool_name in self.tool_map:
+                        try:
+                            # 执行工具
+                            tool_result = await self.tool_map[tool_name].ainvoke(tool_args)
+                            # 创建工具消息
+                            tool_message = ToolMessage(
+                                content=str(tool_result),
+                                tool_call_id=tool_call_id,
+                                name=tool_name
+                            )
+                            # 添加工具消息
+                            messages.append(tool_message)
+                            # 计算并添加ToolMessage内容的token数量
+                            self.add_tool_message_tokens(tool_message)
+                        except Exception as e:
+                            # 工具执行失败
+                            error_message = f"Error executing tool {tool_name}: {str(e)}"
+                            tool_message = ToolMessage(
+                                content=error_message,
+                                tool_call_id=tool_call_id,
+                                name=tool_name
+                            )
+                            messages.append(tool_message)
+                            # 计算并添加错误消息的token数量
+                            self.add_tool_message_tokens(tool_message)
+            else:
+                # 没有工具调用，结束循环
+                break
+        
+        return {"messages": messages}
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
@@ -212,10 +353,10 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
         
         # 定义异步执行函数
         async def execute_amap_research():
-            # 创建React Agent来执行工具调用
-            agent = create_react_agent(llm, amap_tools)
+            # 创建自定义React Agent来执行工具调用，支持上下文长度检查
+            agent = CustomReactAgent(llm, amap_tools, max_context_length=15000)
             
-            # 调用React Agent处理查询并实际执行工具，设置递归限制为100
+            # 调用自定义React Agent处理查询并实际执行工具，设置递归限制为100
             response = await agent.ainvoke(
                 {"messages": [{"role": "user", "content": formatted_prompt}]},
                 config={"recursion_limit": 100}
