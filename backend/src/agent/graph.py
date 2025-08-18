@@ -40,6 +40,21 @@ from agent.utils import (
 import asyncio
 import os
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+# 尝试导入 tiktoken，如果失败则使用备用方案
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+    print("⚠️ tiktoken 库未安装，将使用备用 token 计算方法")
+    print("建议安装: pip install tiktoken")
+
+# Qwen3模型配置常量
+QWEN3_MAX_CONTEXT_LENGTH = 20000  # qwen3_32b模型的最大上下文长度
+QWEN3_SAFE_MAX_TOKENS = 5000      # 安全的最大输出tokens，留充足空间给输入
+QWEN3_SAFE_CONTEXT_LENGTH = 18000 # 安全的上下文检查长度，留缓冲空间
+
 load_dotenv()
 
 if os.getenv("GEMINI_API_KEY") is None:
@@ -70,6 +85,7 @@ _mcp_last_health_check = 0  # 最后健康检查时间
 _mcp_health_check_interval = MCP_HEALTH_CHECK_INTERVAL  # 健康检查间隔（秒）
 _mcp_retry_count = 0  # 重试次数
 _max_mcp_retries = MCP_MAX_RETRIES  # 最大重试次数
+_mcp_init_lock = asyncio.Lock()  # 异步锁，防止并发初始化
 
 
 async def check_mcp_health():
@@ -107,50 +123,95 @@ async def initialize_mcp_tools():
     """初始化MCP工具（单例模式，只初始化一次）"""
     global mcp_client, amap_tools, _mcp_initialized, _mcp_retry_count
     
+    import os
+    import threading
+    
+    current_pid = os.getpid()
+    current_thread = threading.current_thread().ident
+    
+    # 双重检查锁定模式：先检查状态，避免不必要的锁等待
     if _mcp_initialized:
         # 检查连接健康状态
         if await check_mcp_health():
-            print(f"🔄 MCP工具已初始化且健康，返回缓存的 {len(amap_tools)} 个工具")
+            print(f"🔄 MCP工具已初始化且健康，返回缓存的 {len(amap_tools)} 个工具 (PID: {current_pid})")
             return amap_tools
         else:
-            print("⚠️ MCP连接不健康，尝试重新初始化...")
+            print(f"⚠️ MCP连接不健康，尝试重新初始化... (PID: {current_pid})")
             _mcp_initialized = False
             _mcp_retry_count += 1
     
-    # 检查重试次数
-    if _mcp_retry_count >= _max_mcp_retries:
-        print(f"❌ MCP工具初始化失败次数过多（{_mcp_retry_count}次），停止重试")
-        amap_tools = []
-        _mcp_initialized = True
+    print(f"🔒 尝试获取MCP初始化锁... (PID: {current_pid}, Thread: {current_thread})")
+    
+    # 使用异步锁防止并发初始化
+    async with _mcp_init_lock:
+        print(f"✅ 获得MCP初始化锁 (PID: {current_pid}, Thread: {current_thread})")
+        
+        # 再次检查状态，防止在等待锁的过程中其他线程已经完成初始化
+        if _mcp_initialized:
+            print(f"🔄 在锁内检查：MCP工具已初始化，返回缓存的 {len(amap_tools)} 个工具 (PID: {current_pid})")
+            return amap_tools
+        
+        # 检查重试次数
+        if _mcp_retry_count >= _max_mcp_retries:
+            print(f"❌ MCP工具初始化失败次数过多（{_mcp_retry_count}次），停止重试 (PID: {current_pid})")
+            amap_tools = []
+            _mcp_initialized = True
+            return amap_tools
+        
+        try:
+            print(f"🚀 {'重新' if _mcp_initialized else '首次'}初始化MCP客户端... (尝试 {_mcp_retry_count + 1}/{_max_mcp_retries}, PID: {current_pid})")
+            
+            # 如果已有客户端，先关闭
+            if mcp_client:
+                try:
+                    await mcp_client.aclose()
+                except:
+                    pass
+            
+            mcp_client = MultiServerMCPClient(MCP_SERVER_CONFIG)
+            
+            # 加载高德MCP工具
+            amap_tools = await mcp_client.get_tools()
+            _mcp_initialized = True
+            _mcp_retry_count = 0  # 重置重试计数
+            print(f"✅ 成功加载 {len(amap_tools)} 个高德MCP工具 (PID: {current_pid})")
+            print(f"🎯 MCP初始化完成，状态标记为: {_mcp_initialized} (PID: {current_pid})")
+            
+        except Exception as e:
+            print(f"⚠️ 高德MCP工具加载失败: {e} (PID: {current_pid})")
+            print("系统将在没有高德地图支持的情况下运行")
+            amap_tools = []
+            _mcp_initialized = True  # 即使失败也标记为已初始化，避免重复尝试
+            print(f"🎯 MCP初始化失败但状态已标记为: {_mcp_initialized} (PID: {current_pid})")
+        
         return amap_tools
+
+
+async def get_mcp_status():
+    """获取MCP工具的当前状态（用于调试）"""
+    global mcp_client, amap_tools, _mcp_initialized, _mcp_retry_count
     
-    try:
-        print(f"🚀 {'重新' if _mcp_initialized else '首次'}初始化MCP客户端... (尝试 {_mcp_retry_count + 1}/{_max_mcp_retries})")
-        
-        # 如果已有客户端，先关闭
-        if mcp_client:
-            try:
-                await mcp_client.aclose()
-            except:
-                pass
-        
-        mcp_client = MultiServerMCPClient(
-            MCP_SERVER_CONFIG
-        )
-        
-        # 加载高德MCP工具
-        amap_tools = await mcp_client.get_tools()
-        _mcp_initialized = True
-        _mcp_retry_count = 0  # 重置重试计数
-        print(f"✅ 成功加载 {len(amap_tools)} 个高德MCP工具")
-        
-    except Exception as e:
-        print(f"⚠️ 高德MCP工具加载失败: {e}")
-        print("系统将在没有高德地图支持的情况下运行")
-        amap_tools = []
-        _mcp_initialized = True  # 即使失败也标记为已初始化，避免重复尝试
+    import os
+    import threading
     
-    return amap_tools
+    current_pid = os.getpid()
+    current_thread = threading.current_thread().ident
+    
+    status = {
+        "pid": current_pid,
+        "thread": current_thread,
+        "initialized": _mcp_initialized,
+        "retry_count": _mcp_retry_count,
+        "tools_count": len(amap_tools) if amap_tools else 0,
+        "client_exists": mcp_client is not None,
+        "lock_locked": _mcp_init_lock.locked() if hasattr(_mcp_init_lock, 'locked') else "Unknown"
+    }
+    
+    print(f"📊 MCP状态报告 (PID: {current_pid}):")
+    for key, value in status.items():
+        print(f"   {key}: {value}")
+    
+    return status
 
 
 async def get_amap_tools():
@@ -169,53 +230,107 @@ async def get_amap_tools():
 class CustomReactAgent:
     """自定义React Agent，支持上下文长度检查和智能停止机制"""
     
-    def __init__(self, llm, tools, max_context_length=15000):
+    def __init__(self, llm, tools, max_context_length=QWEN3_SAFE_CONTEXT_LENGTH):
         self.llm = llm
         self.tools = tools
         self.max_context_length = max_context_length
         self.tool_map = {tool.name: tool for tool in tools}
         self.total_prompt_tokens = 0  # 跟踪总的prompt tokens
+        self.tokenizer = None  # 延迟初始化
+        # 创建带工具的LLM链
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
+    
+    async def _initialize_tokenizer_async(self):
+        """异步初始化分词器"""
+        if not TIKTOKEN_AVAILABLE:
+            raise RuntimeError("tiktoken 库未安装，无法计算 token 数量")
+        
+        try:
+            # 在线程池中执行阻塞操作
+            tokenizer = await asyncio.to_thread(tiktoken.get_encoding, "cl100k_base")
+            print("✅ tiktoken cl100k_base 编码器初始化成功")
+            return tokenizer
+        except Exception as e:
+            print(f"⚠️ tiktoken cl100k_base 编码器初始化失败: {e}")
+            try:
+                # 备用编码器
+                tokenizer = await asyncio.to_thread(tiktoken.get_encoding, "gpt2")
+                print("✅ tiktoken gpt2 编码器初始化成功")
+                return tokenizer
+            except Exception as e2:
+                print(f"⚠️ tiktoken gpt2 编码器初始化失败: {e2}")
+                raise RuntimeError(f"tiktoken 编码器初始化失败: {e2}")
+    
+    async def _ensure_tokenizer(self):
+        """确保分词器已初始化"""
+        if not hasattr(self, 'tokenizer') or self.tokenizer is None:
+            self.tokenizer = await self._initialize_tokenizer_async()
+        return self.tokenizer
     
     def get_total_prompt_tokens(self):
         """获取累积的prompt tokens总数"""
         return self.total_prompt_tokens
     
-    def calculate_text_tokens(self, text):
-        """计算文本的token数量"""
+    async def _generate_final_response(self, messages, reason="达到限制"):
+        """生成最终回答的通用方法，用于复用停止逻辑"""
+        print(f"⚠️ {reason}，停止工具调用并生成最终回答")
+        
+        # 修改最后一条用户消息，添加停止指令
+        stop_instruction = f"""您现在已经{reason}。您应该停止进行工具调用，并基于以上所有信息重新思考，提供您认为最可能的答案。请基于您迄今为止收集的所有信息提供一份全面的总结报告。"""
+        
+        # 添加停止指令作为新的用户消息
+        messages.append(HumanMessage(content=stop_instruction))
+        
+        # 调用LLM生成最终回答 - 使用流式输出
         try:
-            # 对于 ChatOpenAI，使用 get_num_tokens 方法
-            if hasattr(self.llm, 'get_num_tokens'):
-                return self.llm.get_num_tokens(text)
-            # 对于其他 LLM，使用简单的字符估算（粗略估算）
+            stream = self.llm.astream(messages, stream_usage=True)
+            full = await anext(stream)
+            async for chunk in stream:
+                full += chunk
+            final_response = full
+        except Exception as e:
+            print(f"⚠️ 流式输出失败，回退到普通调用: {e}")
+            if 'full' in locals():
+                print(f"📝 当前已保存的输出结果: {full}")
+            final_response = await self.llm.ainvoke(messages)
+
+        messages.append(final_response)
+        return messages
+    
+    async def calculate_text_tokens(self, text):
+        """使用分词工具计算文本的token数量"""
+        if not text:
+            return 0
+        
+        text_str = str(text)
+        
+        # 确保分词器已初始化
+        tokenizer = await self._ensure_tokenizer()
+        
+        # 使用异步方式调用 tokenizer.encode
+        tokens = await asyncio.to_thread(tokenizer.encode, text_str)
+        return len(tokens)
+            
+    
+    async def calculate_messages_tokens(self, messages):
+        """使用分词工具计算消息列表的总 token 数量"""
+        total_tokens = 0
+        
+        for message in messages:
+            if hasattr(message, 'content') and message.content:
+                # 计算消息内容的 token
+                content_tokens = await self.calculate_text_tokens(message.content)
+                total_tokens += content_tokens
+            
+            # 如果是工具调用消息，将 tool_calls 转换为字符串计算 token
+            elif hasattr(message, 'tool_calls') and message.tool_calls:
+                tool_calls_str = str(message.tool_calls)
+                tool_calls_tokens = await self.calculate_text_tokens(tool_calls_str)
+                total_tokens += tool_calls_tokens
             else:
-                # 粗略估算：英文约4个字符1个token，中文约2个字符1个token
-                english_chars = sum(1 for c in text if ord(c) < 128)
-                chinese_chars = len(text) - english_chars
-                return english_chars // 4 + chinese_chars // 2
-        except Exception:
-            # 如果计算失败，使用字符数作为后备方案
-            return len(text) // 3
-    
-    def update_token_usage(self, response):
-        """从LLM响应中提取并更新token使用情况"""
-        if hasattr(response, 'usage') and response.usage:
-            if hasattr(response.usage, 'total_tokens'):
-                self.total_prompt_tokens = response.usage.total_tokens
-        elif hasattr(response, 'response_metadata') and response.response_metadata:
-            # 尝试从response_metadata中获取token信息
-            metadata = response.response_metadata
-            if 'token_usage' in metadata:
-                token_usage = metadata['token_usage']
-                if 'total_tokens' in token_usage:
-                    self.total_prompt_tokens = token_usage['total_tokens']
-        print(f"更新token使用情况: {self.total_prompt_tokens} usage: {response.usage if hasattr(response, 'usage') else 'None'}")
-    
-    def add_tool_message_tokens(self, tool_message):
-        """计算并添加ToolMessage内容的token数量到总计数中"""
-        if hasattr(tool_message, 'content') and tool_message.content:
-            content_tokens = self.calculate_text_tokens(str(tool_message.content))
-            self.total_prompt_tokens += content_tokens
-            print(f"ToolMessage 内容添加了 {content_tokens} 个tokens，总计: {self.total_prompt_tokens}")
+                raise ValueError(f"Unsupported message: {message}")
+        
+        return total_tokens
     
     async def ainvoke(self, input_data, config=None):
         """异步执行React Agent逻辑，支持上下文长度检查"""
@@ -238,34 +353,59 @@ class CustomReactAgent:
         messages = formatted_messages
         iteration = 0
         
+        # 初始化 token 计数
+        self.total_prompt_tokens = await self.calculate_messages_tokens(messages)
+        print(f"🚀 初始消息 token 数量: {self.total_prompt_tokens}")
+        
+        # 添加标记变量来追踪是否需要强制停止
+        should_force_stop = False
+        
         while iteration < max_iterations:
             iteration += 1
             
+            self.total_prompt_tokens = await self.calculate_messages_tokens(messages)
             # 检查上下文长度（使用token数）
             current_tokens = self.get_total_prompt_tokens()
+            print(f"🔄 迭代 {iteration}: 当前 token 数量: {current_tokens}")
             
             if current_tokens > self.max_context_length:
-                # 修改最后一条用户消息，添加停止指令
-                stop_instruction = """您现在已经达到了可以处理的最大上下文长度。您应该停止进行工具调用，并基于以上所有信息重新思考，提供您认为最可能的答案。请基于您迄今为止收集的所有信息提供一份全面的总结报告。"""
-                
-                # 添加停止指令作为新的用户消息
-                messages.append(HumanMessage(content=stop_instruction))
-                
-                # 调用LLM生成最终回答
-                final_response = await self.llm.ainvoke(messages)
-                # 更新token使用情况
-                self.update_token_usage(final_response)
-                messages.append(final_response)
+                messages = await self._generate_final_response(
+                    messages, 
+                    f"达到最大上下文长度限制: {current_tokens} > {self.max_context_length}"
+                )
                 break
             
-            # 创建带工具的LLM链
-            llm_with_tools = self.llm.bind_tools(self.tools)
             
-            # 调用LLM获取下一步行动
-            response = await llm_with_tools.ainvoke(messages)
-            # 更新token使用情况
-            self.update_token_usage(response)
+            # 调用LLM获取下一步行动 - 使用流式输出
+            try:
+                stream = self.llm_with_tools.astream(messages, stream_usage=True)
+                full = await anext(stream)
+                async for chunk in stream:
+                    full += chunk
+                response = full
+            except Exception as e:
+                print(f"⚠️ 流式输出失败，回退到普通调用: {e}")
+                if 'full' in locals():
+                    print(f"📝 当前已保存的输出结果: {full}")
+                print(f"📋 当前消息历史:")
+                for i, msg in enumerate(messages):
+                    role = getattr(msg, 'type', getattr(msg, 'role', 'unknown'))
+                    msg_content = getattr(msg, 'content', str(msg))
+                    
+                    # 处理AIMessageChunk等没有实际content的消息
+                    if not msg_content or msg_content.strip() == '':
+                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                            content = f"[工具调用: {len(msg.tool_calls)}个工具]"
+                        else:
+                            content = "[空消息]"
+                    elif len(str(msg_content)) > 100:
+                        content = f"{str(msg_content)[:50]}...{str(msg_content)[-50:]}"
+                    else:
+                        content = str(msg_content)
+                    print(f"  {i+1}. [{role}] {content}")
+                response = await self.llm_with_tools.ainvoke(messages)
             messages.append(response)
+            self.total_prompt_tokens = await self.calculate_messages_tokens(messages)
 
             if self.get_total_prompt_tokens() > self.max_context_length:
                 print(f"当前token数量: {self.get_total_prompt_tokens()} 超过最大上下文长度: {self.max_context_length}")
@@ -285,14 +425,12 @@ class CustomReactAgent:
                             tool_result = await self.tool_map[tool_name].ainvoke(tool_args)
                             # 创建工具消息
                             tool_message = ToolMessage(
-                                content=str(tool_result),
+                                content=str(tool_result).replace("\n",""),
                                 tool_call_id=tool_call_id,
                                 name=tool_name
                             )
                             # 添加工具消息
                             messages.append(tool_message)
-                            # 计算并添加ToolMessage内容的token数量
-                            self.add_tool_message_tokens(tool_message)
                         except Exception as e:
                             # 工具执行失败
                             error_message = f"Error executing tool {tool_name}: {str(e)}"
@@ -302,15 +440,36 @@ class CustomReactAgent:
                                 name=tool_name
                             )
                             messages.append(tool_message)
-                            # 计算并添加错误消息的token数量
-                            self.add_tool_message_tokens(tool_message)
-                            if self.get_total_prompt_tokens() > self.max_context_length:
-                                print(f"当前token数量: {self.get_total_prompt_tokens()} 超过最大上下文长度: {self.max_context_length}")
-                                break
+                        
+                        # 重新计算token并检查长度
+                        self.total_prompt_tokens = await self.calculate_messages_tokens(messages)
+                        if self.get_total_prompt_tokens() > self.max_context_length:
+                            messages = await self._generate_final_response(
+                                messages, 
+                                f"工具执行后达到最大上下文长度限制: {self.get_total_prompt_tokens()} > {self.max_context_length}"
+                            )
+                            should_force_stop = True
+                            break
             else:
                 # 没有工具调用，结束循环
                 break
+            
+            # 如果需要强制停止，跳出外层循环
+            if should_force_stop:
+                break
         
+        # 检查是否因为达到最大迭代次数而退出循环
+        if iteration >= max_iterations and not should_force_stop:
+            # 检查最后一个响应是否还有工具调用，如果有则需要强制停止
+            last_response = messages[-1] if messages else None
+            if (last_response and hasattr(last_response, 'tool_calls') and 
+                last_response.tool_calls):
+                messages = await self._generate_final_response(
+                    messages, 
+                    f"达到最大迭代次数限制: {iteration}/{max_iterations}"
+                )
+        
+        print(f"🎯 最终 token 数量: {self.get_total_prompt_tokens()}")
         return {"messages": messages}
 
 # Nodes
@@ -336,11 +495,12 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     # init Qwen3 32B
     llm = ChatOpenAI(
         base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
-        max_tokens=10000,
+        max_tokens=QWEN3_SAFE_MAX_TOKENS,
         model="qwen3_32b",
         timeout=120,
-        temperature=1.0,
-        max_retries=2,
+        temperature=0.7,
+        top_p=0.8,
+        presence_penalty=1.0
     )
     structured_llm = llm.with_structured_output(DualSearchQueryList)
 
@@ -351,8 +511,18 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
         research_topic=get_research_topic(state["messages"]),
         number_queries=state["initial_search_query_count"],
     )
-    # Generate the dual search queries
-    result = structured_llm.invoke(formatted_prompt)
+    # Generate the dual search queries using streaming
+    try:
+        stream = structured_llm.stream(formatted_prompt, stream_usage=True)
+        full = next(stream)
+        for chunk in stream:
+            full += chunk
+        result = full
+    except Exception as e:
+        print(f"⚠️ 流式输出失败，回退到普通调用: {e}")
+        if 'full' in locals():
+            print(f"📝 当前已保存的输出结果: {full}")
+        result = structured_llm.invoke(formatted_prompt)
     
     # Convert to Query format for consistency
     web_queries = [{"query": q, "rationale": result.web_rationale} for q in result.web_queries]
@@ -482,11 +652,12 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
         configurable = Configuration.from_runnable_config(config)
         llm = ChatOpenAI(
             base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
-            max_tokens=15000,
+            max_tokens=QWEN3_SAFE_MAX_TOKENS,
             model="qwen3_32b",
             timeout=120,
-            temperature=0.1,
-            max_retries=2,
+            temperature=0.7,
+            top_p=0.8,
+            presence_penalty=1.0
         )
         
         # 使用优化的高德搜索提示
@@ -499,12 +670,12 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
         # 定义异步执行函数
         async def execute_amap_research():
             # 创建自定义React Agent来执行工具调用，支持上下文长度检查
-            agent = CustomReactAgent(llm, amap_tools, max_context_length=15000)
+            agent = CustomReactAgent(llm, amap_tools, max_context_length=QWEN3_SAFE_CONTEXT_LENGTH)
             
             # 调用自定义React Agent处理查询并实际执行工具，设置递归限制为100
             response = await agent.ainvoke(
                 {"messages": [{"role": "user", "content": formatted_prompt}]},
-                config={"recursion_limit": 100}
+                config={"recursion_limit": 30}
             )
             
             # 获取最后一条消息的内容
@@ -563,13 +734,26 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     # init Reflection Model
     llm = ChatOpenAI(
         base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
-        max_tokens=15000,
+        max_tokens=QWEN3_SAFE_MAX_TOKENS,
         model="qwen3_32b",
         timeout=120,
-        temperature=1.0,
-        max_retries=2,
+        temperature=0.7,
+        top_p=0.8,
+        presence_penalty=1.0
     )
-    result = llm.with_structured_output(DualReflection).invoke(formatted_prompt)
+    # Generate reflection using streaming
+    structured_reflection_llm = llm.with_structured_output(DualReflection)
+    try:
+        stream = structured_reflection_llm.stream(formatted_prompt, stream_usage=True)
+        full = next(stream)
+        for chunk in stream:
+            full += chunk
+        result = full
+    except Exception as e:
+        print(f"⚠️ 流式输出失败，回退到普通调用: {e}")
+        if 'full' in locals():
+            print(f"📝 当前已保存的输出结果: {full}")
+        result = structured_reflection_llm.invoke(formatted_prompt)
 
     # Combine web and map follow-up queries for backward compatibility
     combined_follow_up_queries = result.web_follow_up_queries + result.map_follow_up_queries
@@ -656,25 +840,69 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
 
     # Format the prompt
     current_date = get_current_date()
-    # 合并网络搜索和高德搜索结果
-    all_research_results = state.get("web_research_result", []) + state.get("amap_research_result", [])
+    
+    # 过滤并平衡处理搜索结果
+    def filter_valid_results(results):
+        """过滤掉失败的搜索结果"""
+        valid_results = []
+        for result in results:
+            # 过滤掉包含错误信息的结果
+            if (result and 
+                not any(error_keyword in result for error_keyword in [
+                    "搜索失败", "Error code:", "返回无效响应", 
+                    "搜索结果（无引用信息）", "Google Search API", 
+                    "没有找到相关的搜索结果", "无法完成", "抱歉"
+                ]) and
+                len(result.strip()) > 50):  # 确保结果有实质内容
+                valid_results.append(result.strip())
+        return valid_results
+    
+    # 分别获取和过滤web搜索和高德搜索结果
+    web_results = filter_valid_results(state.get("web_research_result", []))
+    amap_results = filter_valid_results(state.get("amap_research_result", []))
+    
+    # 平衡合并结果，确保两种搜索结果得到平等对待
+    balanced_results = []
+    max_len = max(len(web_results), len(amap_results))
+    
+    for i in range(max_len):
+        if i < len(web_results):
+            balanced_results.append(f"**网络搜索发现：**\n{web_results[i]}")
+        if i < len(amap_results):
+            balanced_results.append(f"**地图位置信息：**\n{amap_results[i]}")
+    
+    # 如果没有有效结果，添加提示信息
+    if not balanced_results:
+        balanced_results = ["根据搜索结果，未能获取到详细的相关信息。建议您通过其他渠道获取更多信息。"]
     
     formatted_prompt = answer_instructions.format(
         current_date=current_date,
         research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(all_research_results),
+        summaries="\n\n---\n\n".join(balanced_results),
     )
 
     # init Answer Model, default to Qwen3 32B
     llm = ChatOpenAI(
         base_url="http://proxy2-search.proxy.amap.com/zjy_llm_qwen/v1",
-        max_tokens=15000,
+        max_tokens=QWEN3_SAFE_MAX_TOKENS,
         model="qwen3_32b",
         timeout=120,
-        temperature=0,
-        max_retries=2,
+        temperature=0.7,
+        top_p=0.8,
+        presence_penalty=1.0
     )
-    result = llm.invoke(formatted_prompt)
+    # Generate final answer using streaming
+    try:
+        stream = llm.stream(formatted_prompt, stream_usage=True)
+        full = next(stream)
+        for chunk in stream:
+            full += chunk
+        result = full
+    except Exception as e:
+        print(f"⚠️ 流式输出失败，回退到普通调用: {e}")
+        if 'full' in locals():
+            print(f"📝 当前已保存的输出结果: {full}")
+        result = llm.invoke(formatted_prompt)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
     unique_sources = []
@@ -699,8 +927,17 @@ async def make_graph():
     Returns:
         编译好的LangGraph图实例
     """
+    import os
+    current_pid = os.getpid()
+    print(f"🏗️ 开始创建LangGraph图 (PID: {current_pid})")
+    
     # 确保MCP工具已初始化（只初始化一次）
+    print(f"🔧 检查MCP工具状态 (PID: {current_pid})")
+    await get_mcp_status()
+    
     await initialize_mcp_tools()
+    
+    print(f"✅ MCP工具初始化完成，开始创建图 (PID: {current_pid})")
     
     # 创建Agent图
     builder = StateGraph(OverallState, config_schema=Configuration)
@@ -732,6 +969,7 @@ async def make_graph():
     # 完成答案
     builder.add_edge("finalize_answer", END)
 
+    print(f"🎯 LangGraph图创建完成 (PID: {current_pid})")
     return builder.compile(
         name="pro-search-agent"
         # 注意：递归限制在新版本LangGraph中通过其他方式设置
