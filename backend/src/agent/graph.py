@@ -53,7 +53,7 @@ except ImportError:
 # Qwen3模型配置常量
 QWEN3_MAX_CONTEXT_LENGTH = 20000  # qwen3_32b模型的最大上下文长度
 QWEN3_SAFE_MAX_TOKENS = 5000      # 安全的最大输出tokens，留充足空间给输入
-QWEN3_SAFE_CONTEXT_LENGTH = 18000 # 安全的上下文检查长度，留缓冲空间
+QWEN3_SAFE_CONTEXT_LENGTH = 10000 # 安全的上下文检查长度，留缓冲空间
 
 load_dotenv()
 
@@ -373,6 +373,7 @@ class CustomReactAgent:
                     messages, 
                     f"达到最大上下文长度限制: {current_tokens} > {self.max_context_length}"
                 )
+                should_force_stop = True
                 break
             
             
@@ -406,10 +407,6 @@ class CustomReactAgent:
                 response = await self.llm_with_tools.ainvoke(messages)
             messages.append(response)
             self.total_prompt_tokens = await self.calculate_messages_tokens(messages)
-
-            if self.get_total_prompt_tokens() > self.max_context_length:
-                print(f"当前token数量: {self.get_total_prompt_tokens()} 超过最大上下文长度: {self.max_context_length}")
-                continue
             
             # 检查是否需要调用工具
             if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -441,15 +438,15 @@ class CustomReactAgent:
                             )
                             messages.append(tool_message)
                         
-                        # 重新计算token并检查长度
-                        self.total_prompt_tokens = await self.calculate_messages_tokens(messages)
-                        if self.get_total_prompt_tokens() > self.max_context_length:
-                            messages = await self._generate_final_response(
-                                messages, 
-                                f"工具执行后达到最大上下文长度限制: {self.get_total_prompt_tokens()} > {self.max_context_length}"
-                            )
-                            should_force_stop = True
-                            break
+                # 重新计算token并检查长度
+                self.total_prompt_tokens = await self.calculate_messages_tokens(messages)
+                if self.get_total_prompt_tokens() > self.max_context_length:
+                    messages = await self._generate_final_response(
+                        messages, 
+                        f"工具执行后达到最大上下文长度限制: {self.get_total_prompt_tokens()} > {self.max_context_length}"
+                    )
+                    should_force_stop = True
+                    break
             else:
                 # 没有工具调用，结束循环
                 break
@@ -460,15 +457,11 @@ class CustomReactAgent:
         
         # 检查是否因为达到最大迭代次数而退出循环
         if iteration >= max_iterations and not should_force_stop:
-            # 检查最后一个响应是否还有工具调用，如果有则需要强制停止
-            last_response = messages[-1] if messages else None
-            if (last_response and hasattr(last_response, 'tool_calls') and 
-                last_response.tool_calls):
-                messages = await self._generate_final_response(
-                    messages, 
-                    f"达到最大迭代次数限制: {iteration}/{max_iterations}"
-                )
-        
+            messages = await self._generate_final_response(
+                messages, 
+                f"达到最大迭代次数限制: {iteration}/{max_iterations}"
+            )
+    
         print(f"🎯 最终 token 数量: {self.get_total_prompt_tokens()}")
         return {"messages": messages}
 
@@ -682,8 +675,11 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
             last_message = response["messages"][-1]
             return last_message.content if hasattr(last_message, 'content') else str(last_message)
         
-        # 在同步函数中运行异步代码
-        result_content = asyncio.run(execute_amap_research())
+        # 在同步函数中运行异步代码，设置超时时间为180秒
+        async def run_with_timeout():
+            return await asyncio.wait_for(execute_amap_research(), timeout=180.0)
+        
+        result_content = asyncio.run(run_with_timeout())
         
         # 格式化结果
         formatted_result = f"**高德地图搜索结果**\n查询：{search_query}\n\n{result_content}"
@@ -693,6 +689,13 @@ def amap_research(state: AmapSearchState, config: RunnableConfig) -> OverallStat
             "amap_research_result": [formatted_result],
         }
         
+    except asyncio.TimeoutError:
+        # 如果高德搜索超时，返回超时错误信息
+        error_result = f"高德地图搜索超时（180秒）：请求处理时间过长\n查询：{state['search_query']}"
+        return {
+            "search_query": [state["search_query"]],
+            "amap_research_result": [error_result],
+        }
     except Exception as e:
         # 如果高德搜索失败，返回错误信息
         error_result = f"高德地图搜索失败：{str(e)}\n查询：{state['search_query']}"
@@ -851,6 +854,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
                 not any(error_keyword in result for error_keyword in [
                     "搜索失败", "Error code:", "返回无效响应", 
                     "搜索结果（无引用信息）", "Google Search API", 
+                    "高德地图搜索超时",
                     "没有找到相关的搜索结果", "无法完成", "抱歉"
                 ]) and
                 len(result.strip()) > 50):  # 确保结果有实质内容
